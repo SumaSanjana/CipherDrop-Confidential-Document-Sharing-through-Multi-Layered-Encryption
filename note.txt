@@ -1,0 +1,621 @@
+secure_file_transfer/
+├── app.py
+├── config.py
+├── requirements.txt
+├── templates/
+│   ├── base.html
+│   ├── signup.html
+│   ├── login.html
+│   ├── dashboard.html
+│   ├── send_file.html
+│   ├── received_files.html
+│   └── decrypt_file.html
+├── static/
+│   ├── css/
+│   │   └── styles.css
+│   └── js/
+│       └── scripts.js
+├── uploads/
+│   └── encrypted/
+└── instance/
+    └── app.db
+
+
+
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from cryptography.fernet import Fernet
+from Crypto.Cipher import AES, DES3
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
+from flask import abort
+
+import os
+import hashlib
+import smtplib
+from email.mime.text import MIMEText
+import base64
+import uuid
+
+app = Flask(__name__)
+app.config.from_object('config.Config')
+
+# Ensure directories exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(os.path.dirname(os.path.join(app.config['BASE_DIR'], 'instance', 'app.db')), exist_ok=True)
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+# Models
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+
+class File(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(200), nullable=False)
+    encrypted_path = db.Column(db.String(200), nullable=False)
+    sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    receiver_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    algorithm = db.Column(db.String(50), nullable=False)
+    timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
+    # Relationships
+    sender = db.relationship('User', foreign_keys=[sender_id], backref='sent_files')
+    receiver = db.relationship('User', foreign_keys=[receiver_id], backref='received_files')
+
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))
+
+# Encryption Functions
+def encrypt_file_fernet(file_data, key):
+    fernet = Fernet(key)
+    return fernet.encrypt(file_data), key
+
+def decrypt_file_fernet(encrypted_data, key):
+    fernet = Fernet(key)
+    return fernet.decrypt(encrypted_data)
+
+def encrypt_file_aes(file_data, key):
+    cipher = AES.new(key, AES.MODE_CBC)
+    ct_bytes = cipher.encrypt(pad(file_data, AES.block_size))
+    iv = cipher.iv
+    return ct_bytes, key, iv
+
+def decrypt_file_aes(encrypted_data, key, iv):
+    cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+    pt = unpad(cipher.decrypt(encrypted_data), AES.block_size)
+    return pt
+
+def encrypt_file_3des(file_data, key):
+    cipher = DES3.new(key, DES3.MODE_CBC)
+    ct_bytes = cipher.encrypt(pad(file_data, DES3.block_size))
+    iv = cipher.iv
+    return ct_bytes, key, iv
+
+def decrypt_file_3des(encrypted_data, key, iv):
+    cipher = DES3.new(key, DES3.MODE_CBC, iv=iv)
+    pt = unpad(cipher.decrypt(encrypted_data), DES3.block_size)
+    return pt
+
+# Email Function
+def send_email(to_email, subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = app.config['MAIL_USERNAME']
+    msg['To'] = to_email
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+        server.login(app.config['MAIL_USERNAME'], app.config['MAIL_PASSWORD'])
+        server.send_message(msg)
+
+# Routes
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form['username']
+        email = request.form['email']
+        password = request.form['password']
+        hashed_password = generate_password_hash(password)
+        user = User(username=username, email=email, password=hashed_password)
+        db.session.add(user)
+        db.session.commit()
+        send_email(email, 'Welcome to Secure File Transfer', 'Thank you for signing up!')
+        flash('Signup successful! Please log in.')
+        return redirect(url_for('login'))
+    return render_template('signup.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        user = User.query.filter_by(email=request.form['email']).first()
+        if user and check_password_hash(user.password, request.form['password']):
+            login_user(user)
+            return redirect(url_for('dashboard'))
+        flash('Invalid credentials.')
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+@app.route('/dashboard', methods=['GET', 'POST'])
+@login_required
+def dashboard():
+    if request.method == 'POST':
+        search = request.form['search']
+        users = User.query.filter(
+            (User.username.ilike(f'%{search}%')) | (User.email.ilike(f'%{search}%'))
+        ).all()
+        return render_template('dashboard.html', users=users)
+    return render_template('dashboard.html', users=[])
+
+@app.route('/send_file/<int:receiver_id>', methods=['GET', 'POST'])
+@login_required
+def send_file(receiver_id):
+    receiver = db.session.get(User, receiver_id) or abort(404)
+    if request.method == 'POST':
+        file = request.files['file']
+        algorithm = request.form['algorithm']
+        file_data = file.read()
+        
+        # Generate key based on algorithm
+        if algorithm == 'fernet':
+            key = Fernet.generate_key()
+            encrypted_data, key = encrypt_file_fernet(file_data, key)
+            iv = None
+        elif algorithm == 'aes':
+            key = get_random_bytes(16)
+            encrypted_data, key, iv = encrypt_file_aes(file_data, key)
+        elif algorithm == '3des':
+            key = get_random_bytes(24)
+            encrypted_data, key, iv = encrypt_file_3des(file_data, key)
+        
+        # Save encrypted file
+        filename = f"{uuid.uuid4()}_{file.filename}"
+        encrypted_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        with open(encrypted_path, 'wb') as f:
+            f.write(encrypted_data)
+        
+        # Save file metadata
+        file_record = File(
+            filename=file.filename,
+            encrypted_path=encrypted_path,
+            sender_id=current_user.id,
+            receiver_id=receiver_id,
+            algorithm=algorithm
+        )
+        db.session.add(file_record)
+        db.session.commit()
+        
+        # Send email with key
+        key_b64 = base64.b64encode(key).decode()
+        iv_b64 = base64.b64encode(iv).decode() if iv else None
+        body = f"A file has been shared with you.\nEncryption Key: {key_b64}"
+        if iv:
+            body += f"\nIV: {iv_b64}"
+        send_email(receiver.email, 'New File Shared', body)
+        
+        flash('File sent successfully!')
+        return redirect(url_for('dashboard'))
+    
+    return render_template('send_file.html', receiver=receiver)
+
+@app.route('/received_files')
+@login_required
+def received_files():
+    files = File.query.filter_by(receiver_id=current_user.id).all()
+    return render_template('received_files.html', files=files)
+
+@app.route('/decrypt_file/<int:file_id>', methods=['GET', 'POST'])
+@login_required
+def decrypt_file(file_id):
+    file = db.session.get(File, file_id) or abort(404)
+    if file.receiver_id != current_user.id:
+        flash('Unauthorized access.')
+        return redirect(url_for('received_files'))
+    
+    if request.method == 'POST':
+        try:
+            key_b64 = request.form['key']
+            key = base64.b64decode(key_b64)
+            iv = base64.b64decode(request.form['iv']) if 'iv' in request.form else None
+            
+            # Check if file exists
+            if not os.path.exists(file.encrypted_path):
+                flash('Encrypted file not found on server.')
+                return redirect(url_for('received_files'))
+            
+            with open(file.encrypted_path, 'rb') as f:
+                encrypted_data = f.read()
+            
+            try:
+                if file.algorithm == 'fernet':
+                    decrypted_data = decrypt_file_fernet(encrypted_data, key)
+                elif file.algorithm == 'aes':
+                    if not iv:
+                        flash('IV required for AES decryption.')
+                        return redirect(url_for('decrypt_file', file_id=file_id))
+                    decrypted_data = decrypt_file_aes(encrypted_data, key, iv)
+                elif file.algorithm == '3des':
+                    if not iv:
+                        flash('IV required for 3DES decryption.')
+                        return redirect(url_for('decrypt_file', file_id=file_id))
+                    decrypted_data = decrypt_file_3des(encrypted_data, key, iv)
+                
+                temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"decrypted_{file.filename}")
+                with open(temp_path, 'wb') as f:
+                    f.write(decrypted_data)
+                
+                # Send file and clean up
+                try:
+                    response = send_file(temp_path, as_attachment=True, download_name=file.filename)
+                    os.remove(temp_path)  # Clean up temporary file after sending
+                    return response
+                except Exception as e:
+                    flash(f'Failed to send file: {str(e)}')
+                    os.remove(temp_path)  # Clean up even if sending fails
+                    return redirect(url_for('decrypt_file', file_id=file_id))
+            
+            except Exception as e:
+                flash(f'Decryption failed: {str(e)}')
+                return redirect(url_for('decrypt_file', file_id=file_id))
+        
+        except base64.binascii.Error:
+            flash('Invalid key or IV format.')
+            return redirect(url_for('decrypt_file', file_id=file_id))
+    
+    return render_template('decrypt_file.html', file=file)
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(ssl_context='adhoc', debug=True) this is app.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+import os
+
+class Config:
+    SECRET_KEY = os.urandom(24)
+    # Use an absolute path for the database
+    BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+    SQLALCHEMY_DATABASE_URI = f'sqlite:///{os.path.join(BASE_DIR, "instance", "app.db")}'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads', 'encrypted')
+    MAIL_USERNAME = 'varunyadav4868@gmail.com'  # Replace with your email
+    MAIL_PASSWORD = 'idsv pthg zajg ohaa'     # Replace with your app-specific password
+ this is config.py
+
+
+
+
+
+ body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+}
+nav {
+    background: #333;
+    padding: 10px;
+}
+nav a {
+    color: white;
+    margin-right: 10px;
+    text-decoration: none;
+}
+.container {
+    max-width: 800px;
+    margin: 20px auto;
+    padding: 20px;
+}
+form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 400px;
+}
+.alert {
+    background: #f8d7da;
+    color: #721c24;
+    padding: 10px;
+    margin-bottom: 10px;
+}
+button {
+    background: #007bff;
+    color: white;
+    border: none;
+    padding: 10px;
+    cursor: pointer;
+}
+button:hover {
+    background: #0056b3;
+}this is style .css
+
+
+
+
+
+
+
+document.addEventListener('DOMContentLoaded', () => {
+    // Form validation for signup
+    const signupForm = document.querySelector('form[action="/signup"]');
+    if (signupForm) {
+        signupForm.addEventListener('submit', (e) => {
+            const username = signupForm.querySelector('input[name="username"]').value;
+            const email = signupForm.querySelector('input[name="email"]').value;
+            const password = signupForm.querySelector('input[name="password"]').value;
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+            if (username.length < 3) {
+                alert('Username must be at least 3 characters long.');
+                e.preventDefault();
+            } else if (!emailRegex.test(email)) {
+                alert('Please enter a valid email address.');
+                e.preventDefault();
+            } else if (password.length < 6) {
+                alert('Password must be at least 6 characters long.');
+                e.preventDefault();
+            }
+        });
+    }
+
+    // Form validation for login
+    const loginForm = document.querySelector('form[action="/login"]');
+    if (loginForm) {
+        loginForm.addEventListener('submit', (e) => {
+            const email = loginForm.querySelector('input[name="email"]').value;
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+            if (!emailRegex.test(email)) {
+                alert('Please enter a valid email address.');
+                e.preventDefault();
+            }
+        });
+    }
+
+    // Confirmation for file upload
+    const sendFileForm = document.querySelector('form[action*="/send_file"]');
+    if (sendFileForm) {
+        sendFileForm.addEventListener('submit', (e) => {
+            const fileInput = sendFileForm.querySelector('input[name="file"]');
+            if (!fileInput.files.length) {
+                alert('Please select a file to upload.');
+                e.preventDefault();
+            } else if (!confirm('Are you sure you want to send this file?')) {
+                e.preventDefault();
+            }
+        });
+    }
+
+    // Validation for decrypt form
+    const decryptForm = document.querySelector('form[action*="/decrypt_file"]');
+    if (decryptForm) {
+        decryptForm.addEventListener('submit', (e) => {
+            const key = decryptForm.querySelector('input[name="key"]').value;
+            const iv = decryptForm.querySelector('input[name="iv"]');
+            
+            if (!key) {
+                alert('Please enter the encryption key.');
+                e.preventDefault();
+            } else if (iv && !iv.value) {
+                alert('Please enter the IV for this algorithm.');
+                e.preventDefault();
+            }
+        });
+    }
+
+    // Dynamic feedback for file input
+    const fileInput = document.querySelector('input[name="file"]');
+    if (fileInput) {
+        fileInput.addEventListener('change', () => {
+            const fileName = fileInput.files[0]?.name || 'No file selected';
+            const label = fileInput.closest('form').querySelector('label[for="file"]');
+            if (label) {
+                label.textContent = `Selected: ${fileName}`;
+            }
+        });
+    }
+});this is script.js
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure File Transfer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+</head>
+<body>
+    <nav>
+        {% if current_user.is_authenticated %}
+            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('received_files') }}">Received Files</a>
+            <a href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+            <a href="{{ url_for('login') }}">Login</a>
+            <a href="{{ url_for('signup') }}">Signup</a>
+        {% endif %}
+    </nav>
+    <div class="container">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
+                {% for message in messages %}
+                    <div class="alert">{{ message }}</div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+        {% block content %}{% endblock %}
+    </div>
+    <script src="{{ url_for('static', filename='js/scripts.js') }}"></script>
+</body>
+</html>base.html
+
+
+
+
+
+
+
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Signup</h2>
+<form method="POST">
+    <label>Username:</label>
+    <input type="text" name="username" required><br>
+    <label>Email:</label>
+    <input type="email" name="email" required><br>
+    <label>Password:</label>
+    <input type="password" name="password" required><br>
+    <button type="submit">Signup</button>
+</form>
+{% endblock %}this is signup.html
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Login</h2>
+<form method="POST">
+    <label>Email:</label>
+    <input type="email" name="email" required><br>
+    <label>Password:</label>
+    <input type="password" name="password" required><br>
+    <button type="submit">Login</button>
+</form>
+{% endblock %}this is login.html
+
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Welcome, {{ current_user.username }}</h2>
+<form method="POST">
+    <label>Search User:</label>
+    <input type="text" name="search" placeholder="Username or Email">
+    <button type="submit">Search</button>
+</form>
+{% if users %}
+    <h3>Users Found:</h3>
+    <ul>
+        {% for user in users %}
+            <li>{{ user.username }} ({{ user.email }}) 
+                <a href="{{ url_for('send_file', receiver_id=user.id) }}">Send File</a>
+            </li>
+        {% endfor %}
+    </ul>
+{% endif %}
+{% endblock %}this is dashboard.html
+
+
+
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Send File to {{ receiver.username }}</h2>
+<form method="POST" enctype="multipart/form-data">
+    <label>Select File:</label>
+    <input type="file" name="file" required><br>
+    <label>Encryption Algorithm:</label>
+    <select name="algorithm" required>
+        <option value="fernet">Fernet</option>
+        <option value="aes">AES</option>
+        <option value="3des">Triple DES</option>
+    </select><br>
+    <button type="submit">Send</button>
+</form>
+{% endblock %}this send_file.html
+
+
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Decrypt File: {{ file.filename }}</h2>
+<form method="POST">
+    <label>Encryption Key (Base64):</label>
+    <input type="text" name="key" required><br>
+    {% if file.algorithm != 'fernet' %}
+        <label>IV (Base64):</label>
+        <input type="text" name="iv" required><br>
+    {% endif %}
+    <button type="submit">Decrypt</button>
+</form>
+{% endblock %}this is decrypt_file.html
+
+
+
+
+{% extends "base.html" %}
+{% block content %}
+<h2>Received Files</h2>
+{% if files %}
+    <ul>
+        {% for file in files %}
+            <li>
+                {{ file.filename }} from 
+                {% if file.sender %}
+                    {{ file.sender.username }}
+                {% else %}
+                    Unknown Sender
+                {% endif %}
+                at {{ file.timestamp }}
+                <a href="{{ url_for('decrypt_file', file_id=file.id) }}">Decrypt</a>
+            </li>
+        {% endfor %}
+    </ul>
+{% else %}
+    <p>No files received.</p>
+{% endif %}
+{% endblock %}this is received_files
+
+
+
